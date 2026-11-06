@@ -32,7 +32,7 @@ if mod_dir.exists():
 for name in ('dictado-alternar', 'dictado-herdr-pegar'):
     if (bin_dir / name).exists():
         sys.exit(f'{bin_dir / name} already exists; remove or rename it before installation.')
-shutil.copytree(root / 'mod', mod_dir)
+shutil.copytree(root / 'mods' / 'dictado', mod_dir)
 if args.ui_language == 'en':
     js = mod_dir / 'main.js'
     text = js.read_text()

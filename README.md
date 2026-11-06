@@ -2,6 +2,8 @@
 
 [Español](README.es.md) · English
 
+![Herdr Voice button](preview.png)
+
 An experimental voice dictation mod for [Herdr App](https://github.com/herdrdev/herdr-app). Click **Dictate**, speak, and click again. [Voxtype](https://voxtype.io/) transcribes locally and the text is pasted into the selected Herdr agent pane. Review it before pressing Enter.
 
 > Early preview: tested on one Fedora/GNOME/Wayland machine. Repeated voice capture and installation on a clean machine still need independent testing. This is a community project, not an official Herdr or Voxtype product.
