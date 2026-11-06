@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""Session-scoped dictation controller. No audio or transcript is logged."""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+DEFAULT_TERMS = ['Odoo', 'PostgreSQL', 'Python', 'Mercantil', 'EcoFlow', 'Herdr', 'Voxtype', 'Claude', 'Codex']
+ACTIVE = {'starting', 'recording', 'stopping', 'transcribing', 'delivering', 'cancelling', 'updating'}
+MESSAGES = {
+    'ready': ('Listo para dictar', 'Ready to dictate'),
+    'pasted': ('Texto pegado', 'Text pasted'),
+    'copied': ('Texto copiado al portapapeles', 'Text copied to clipboard'),
+    'changed': ('El panel cambió; texto copiado al portapapeles', 'Pane changed; text copied to clipboard'),
+    'cancelled': ('Dictado cancelado', 'Dictation cancelled'),
+    'limit': ('Límite alcanzado; transcribiendo', 'Limit reached; transcribing'),
+    'warning': ('Quedan 30 segundos de grabación', '30 seconds of recording left'),
+    'no_result': ('No hubo resultado; comprueba la voz y el micrófono', 'No result; check speech and microphone'),
+    'paste_failed': ('Falló el pegado; puedes recuperar el texto', 'Paste failed; text can be recovered'),
+    'copy_failed': ('Falló el portapapeles; el texto sigue disponible', 'Clipboard failed; text is still available'),
+    'wrong_target': ('Vuelve al panel original para reintentar el pegado', 'Return to the original pane to retry paste'),
+    'worker_failed': ('El dictado se interrumpió; revisa Voxtype', 'Dictation interrupted; check Voxtype'),
+    'unavailable': ('Voxtype no está disponible', 'Voxtype is unavailable'),
+    'busy': ('Espera a que termine el dictado activo', 'Wait for the active dictation to finish'),
+    'cleared': ('Último dictado borrado', 'Last dictation cleared'),
+    'settings': ('Ajustes guardados', 'Settings saved'),
+    'settings_failed': ('No se aplicaron los ajustes; se restauró la configuración anterior', 'Settings failed; previous configuration restored'),
+}
+
+
+def config_home():
+    return Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config')))
+
+
+def runtime_dir():
+    root = os.environ.get('XDG_RUNTIME_DIR')
+    if not root:
+        raise RuntimeError('XDG_RUNTIME_DIR is required for temporary private storage')
+    path = Path(root) / 'herdr-voice'
+    path.mkdir(mode=0o700, exist_ok=True)
+    if path.is_symlink() or path.stat().st_uid != os.getuid():
+        raise RuntimeError('Unsafe runtime directory')
+    path.chmod(0o700)
+    return path
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {} if default is None else default
+
+
+def write_json(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        with tmp.open('x', encoding='utf-8') as f:
+            tmp.chmod(0o600)
+            json.dump(data, f, ensure_ascii=False)
+            f.write('\n')
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def locked(blocking=True):
+    with (runtime_dir() / 'control.lock').open('a+') as lock:
+        os.chmod(lock.name, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        yield
+
+
+def prefs():
+    return read_json(config_home() / 'herdr-voice/preferences.json', {
+        'ui_language': 'es', 'glossary': DEFAULT_TERMS, 'rules': [], 'max_duration': 300,
+    })
+
+
+def message(code):
+    return MESSAGES.get(code, (code, code))[prefs().get('ui_language') == 'en']
+
+
+def run(argv, **kwargs):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=10, check=True, **kwargs)
+
+
+def engine_state():
+    try:
+        return run(['voxtype', 'status']).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return 'unavailable'
+
+
+def notify(code):
+    try:
+        run(['notify-send', 'Herdr Voice', message(code)])
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def target():
+    data = json.loads(run(['herdr-app', 'status']).stdout)
+    result = {k: data.get(k) for k in ('space', 'tab', 'focused_pane')}
+    spaces = json.loads(run(['herdr-app', 'ls']).stdout)['spaces']
+    for space in spaces:
+        for tab in space.get('tabs', []):
+            for pane in tab.get('terminals', []):
+                if space['id'] == result['space'] and tab['id'] == result['tab'] and pane['pane'] == result['focused_pane']:
+                    result['terminal'] = pane['terminal'] if not space.get('machine') else None
+    if data.get('agent') and result.get('terminal') != data['agent']:
+        result['terminal'] = None  # A different terminal may be shown in this pane.
+    return result
+
+
+def same_target(original, current):
+    return bool(original.get('focused_pane')) and all(original.get(k) == current.get(k) for k in ('space', 'tab', 'focused_pane', 'terminal'))
+
+
+def session():
+    return read_json(runtime_dir() / 'state.json')
+
+
+def save_session(data):
+    write_json(runtime_dir() / 'state.json', data)
+
+
+def set_notice(data, code):
+    data['notice'] = code
+    save_session(data)
+
+
+def apply_rules(text, rules):
+    # Single pass: replacements cannot cascade or replace parts of other words.
+    table = {r['from'].casefold(): r['to'] for r in rules}
+    if not table:
+        return text
+    pattern = r'(?<!\w)(?:' + '|'.join(re.escape(k) for k in sorted(table, key=len, reverse=True)) + r')(?!\w)'
+    return re.sub(pattern, lambda m: table.get(m.group().casefold(), m.group()), text, flags=re.IGNORECASE)
+
+
+def deliver(last, retry=False, sid=None):
+    from targeted_paste import PasteConnection, PasteUnavailable
+    connection = None
+    code = 'changed'
+    try:
+        current = target()
+        if retry and not same_target(last['target'], current):
+            return 'wrong_target'
+        if same_target(last['target'], current):
+            code = 'copied'  # Unsupported cores safely fall back to clipboard.
+            try:
+                connection = PasteConnection(last['target'].get('terminal'))
+                if not same_target(last['target'], target()):
+                    connection.close()
+                    connection = None
+                    code = 'changed'
+            except PasteUnavailable:
+                connection = None
+        with locked():
+            s = session()
+            if sid and (s.get('id') != sid or not s.get('valid')):
+                return None
+            if retry and s.get('phase') in ACTIVE:
+                return 'busy'
+            if sid:
+                write_json(runtime_dir() / 'last.json', last)
+            # The completion boundary is short: no clipboard/status subprocesses
+            # under the lock. Cancellation before this boundary invalidates input.
+            if connection:
+                try:
+                    connection.paste(last['text'])
+                    code = 'pasted'
+                except PasteUnavailable:
+                    code = 'paste_failed'
+            if sid:
+                s.update(phase='idle', valid=False, notice=code)
+                save_session(s)
+        if connection and code == 'pasted':
+            try:
+                connection.flush()
+            except PasteUnavailable:
+                code = 'paste_failed'
+        try:
+            run(['wl-copy', '--type', 'text/plain;charset=utf-8'], input=last['text'])
+        except (OSError, subprocess.SubprocessError):
+            if code != 'pasted':
+                code = 'copy_failed'
+        return code
+    finally:
+        if connection:
+            connection.close()
+
+
+def status():
+    actual = engine_state()
+    s = session()
+    try:
+        with locked(blocking=False):
+            s = session()
+            if s.get('phase') in ACTIVE:
+                try:
+                    pid = s.get('worker_pid', 0)
+                    if pid <= 0:
+                        raise ProcessLookupError()
+                    os.kill(pid, 0)
+                except (ProcessLookupError, PermissionError, ValueError):
+                    cancelled = not s.get('valid', True) and actual == 'idle'
+                    s['phase'] = 'idle' if cancelled else ('error' if actual in ('idle', 'stopped', 'unavailable') else 'cancelling')
+                    s['notice'] = 'cancelled' if cancelled else 'worker_failed'
+                    save_session(s)
+    except BlockingIOError:
+        pass  # Installer/settings jobs hold the mutation lock; status stays responsive.
+    phase = s.get('phase', 'idle')
+    if phase not in ACTIVE and actual != 'idle':
+        phase = 'unavailable' if actual in ('stopped', 'unavailable') else 'external_busy'
+    return {
+        'state': phase, 'engine': actual, 'notice': s.get('notice', 'ready'),
+        'message': message(s.get('notice', 'ready')),
+        'elapsed': max(0, int(time.monotonic() - s.get('started', time.monotonic()))) if phase in ACTIVE else 0,
+        'limit': s.get('limit', prefs().get('max_duration', 300)),
+        'has_last': (runtime_dir() / 'last.json').exists(), **prefs(),
+    }
+
+
+def start():
+    with locked(blocking=False):
+        if session().get('phase') in ACTIVE or engine_state() != 'idle':
+            raise RuntimeError(message('busy'))
+        original = target()
+        if not original.get('focused_pane'):
+            raise RuntimeError('Selecciona un panel de terminal antes de grabar')
+        for stale in runtime_dir().glob('*.txt'):
+            if re.fullmatch(r'[a-f0-9]{32}\.txt', stale.name):
+                stale.unlink(missing_ok=True)
+        sid = uuid.uuid4().hex
+        out = runtime_dir() / (sid + '.txt')
+        out.touch(mode=0o600, exist_ok=False)
+        s = {'id': sid, 'phase': 'starting', 'started': time.monotonic(), 'target': original,
+             'limit': prefs().get('max_duration', 300), 'notice': 'ready', 'valid': True}
+        save_session(s)
+        try:
+            run(['voxtype', 'record', 'start', '--file=' + str(out), '--no-auto-submit', '--no-smart-auto-submit', '--no-osd'])
+            p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', sid],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True, close_fds=True)
+            s['worker_pid'] = p.pid
+            save_session(s)
+        except Exception:
+            out.unlink(missing_ok=True)
+            s.update(phase='error', valid=False, notice='worker_failed')
+            save_session(s)
+            try:
+                run(['voxtype', 'record', 'cancel'])
+            except (OSError, subprocess.SubprocessError):
+                pass
+            raise
+
+
+def stop():
+    with locked():
+        s = session()
+        if s.get('phase') not in ('starting', 'recording'):
+            return
+        if engine_state() == 'recording':
+            run(['voxtype', 'record', 'stop'])
+        s['phase'] = 'stopping'
+        save_session(s)
+
+
+def cancel():
+    with locked():
+        s = session()
+        if s.get('phase') not in ACTIVE or s.get('phase') == 'updating':
+            return
+        s.update(valid=False, phase='cancelling', notice='cancelled')
+        save_session(s)  # Invalidate BEFORE signalling, so a late result cannot paste.
+        run(['voxtype', 'record', 'cancel'])
+        if engine_state() == 'idle':
+            s.update(phase='idle')
+            save_session(s)
+
+
+def worker(sid):
+    out = runtime_dir() / (sid + '.txt')
+    seen_active = False
+    idle_since = None
+    signature = None
+    try:
+        while True:
+            time.sleep(0.5)
+            actual = engine_state()
+            now = time.monotonic()
+            ready = None
+            notification = None
+            with locked():
+                s = session()
+                if s.get('id') != sid:
+                    return
+                if not s.get('valid'):
+                    if actual in ('idle', 'stopped', 'unavailable'):
+                        s.update(phase='idle', notice='cancelled')
+                        save_session(s)
+                        return
+                    if now - s.get('started', now) > s.get('limit', 300) + 600:
+                        s.update(phase='error', notice='worker_failed')
+                        save_session(s)
+                        return
+                    continue
+                if actual in ('recording', 'transcribing'):
+                    seen_active = True
+                    idle_since = None
+                    if s.get('phase') != actual:
+                        if actual == 'transcribing' and now - s['started'] >= s['limit'] - 1:
+                            s['notice'] = 'limit'
+                            notification = 'limit'
+                        s['phase'] = actual
+                        save_session(s)
+                    if actual == 'recording' and now - s['started'] >= s['limit'] - 30 and not s.get('warned'):
+                        s.update(warned=True, notice='warning')
+                        save_session(s)
+                        notification = 'warning'
+                elif actual == 'idle':
+                    size = out.stat().st_size if out.exists() else 0
+                    current = (size, out.stat().st_mtime_ns) if size else None
+                    if current and current == signature:
+                        raw = out.read_text().strip()
+                        if raw:
+                            ready = {'id': sid, 'raw': raw, 'text': apply_rules(raw, prefs().get('rules', [])), 'target': s['target']}
+                            s['phase'] = 'delivering'
+                            save_session(s)
+                    signature = current
+                    idle_since = idle_since or now
+                    if not ready and ((seen_active and now - idle_since > 3) or (not seen_active and now - s['started'] > 15)):
+                        s.update(phase='idle', valid=False, notice='no_result')
+                        save_session(s)
+                        notification = 'no_result'
+                else:
+                    raise RuntimeError(message('unavailable'))
+                if now - s['started'] > s['limit'] + 600:
+                    raise RuntimeError('Transcription timed out')
+            if notification:
+                notify(notification)
+                if notification == 'no_result':
+                    return
+            if ready:
+                code = deliver(ready, sid=sid)
+                if code:
+                    with locked():
+                        s = session()
+                        if s.get('id') == sid and s.get('notice') != 'cancelled':
+                            set_notice(s, code)
+                    notify(code)
+                return
+    except Exception:
+        with locked():
+            s = session()
+            if s.get('id') == sid:
+                s.update(phase='error', valid=False, notice='worker_failed')
+                save_session(s)
+        notify('worker_failed')
+    finally:
+        out.unlink(missing_ok=True)
+
+
+def recover(action):
+    with locked():
+        s = session()
+        if action == 'clear':
+            (runtime_dir() / 'last.json').unlink(missing_ok=True)
+            set_notice(s, 'cleared')
+            return
+        last = read_json(runtime_dir() / 'last.json')
+        if not last:
+            raise RuntimeError('No hay un dictado para recuperar')
+        if action == 'retry' and s.get('phase') in ACTIVE:
+            raise RuntimeError(message('busy'))
+    if action in ('copy', 'copy-raw'):
+        try:
+            run(['wl-copy', '--type', 'text/plain;charset=utf-8'], input=last['raw'] if action == 'copy-raw' else last['text'])
+            code = 'copied'
+        except (OSError, subprocess.SubprocessError):
+            code = 'copy_failed'
+    else:
+        code = deliver(last, retry=True)
+    with locked():
+        set_notice(session(), code)
+    notify(code)
+
+
+def settings(glossary, rules):
+    if not isinstance(glossary, list) or len(glossary) > 100 or any(not isinstance(t, str) or not t.strip() or len(t) > 80 for t in glossary):
+        raise ValueError('Vocabulario inválido: máximo 100 términos de 80 caracteres')
+    if sum(len(t) for t in glossary) > 1500:
+        raise ValueError('Usa un vocabulario breve: máximo 1500 caracteres')
+    if not isinstance(rules, list) or len(rules) > 100:
+        raise ValueError('Máximo 100 correcciones')
+    keys = set()
+    for r in rules:
+        if not isinstance(r, dict) or set(r) != {'from', 'to'} or any(not isinstance(r[k], str) or not r[k].strip() or len(r[k]) > 200 for k in r):
+            raise ValueError('Cada corrección necesita un origen y un destino de hasta 200 caracteres')
+        if r['from'].casefold() in keys:
+            raise ValueError('No repitas el origen de una corrección')
+        keys.add(r['from'].casefold())
+    with locked(blocking=False):
+        if session().get('phase') in ACTIVE or engine_state() != 'idle':
+            raise RuntimeError(message('busy'))
+        sid = uuid.uuid4().hex
+        job = runtime_dir() / ('settings-' + sid + '.json')
+        write_json(job, {'glossary': glossary, 'rules': rules})
+        s = {'id': sid, 'phase': 'updating', 'started': time.monotonic(), 'valid': True, 'notice': 'ready'}
+        try:
+            p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'settings-worker', sid],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True)
+            s['worker_pid'] = p.pid
+            save_session(s)
+        except Exception:
+            job.unlink(missing_ok=True)
+            raise
+
+
+def settings_worker(sid):
+    import importlib.util
+    job = runtime_dir() / ('settings-' + sid + '.json')
+    try:
+        with locked():
+            if session().get('id') != sid or session().get('phase') != 'updating':
+                return
+            data = read_json(job)
+            path = Path(__file__).resolve().parent / 'install.py'
+            spec = importlib.util.spec_from_file_location('herdr_voice_installer', path)
+            installer = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(installer)
+            try:
+                installer.update_preferences(data['glossary'], data['rules'])
+                code = 'settings'
+            except Exception:
+                code = 'settings_failed'
+            s = session()
+            s.update(phase='idle', valid=False, notice=code)
+            save_session(s)
+        notify(code)
+    finally:
+        job.unlink(missing_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['status', 'start', 'stop', 'toggle', 'cancel', 'copy', 'copy-raw', 'retry', 'clear', 'settings', 'worker', 'settings-worker'])
+    parser.add_argument('session_id', nargs='?')
+    parser.add_argument('--glossary', default='[]')
+    parser.add_argument('--rules', default='[]')
+    args = parser.parse_args()
+    try:
+        if args.action in ('worker', 'settings-worker'):
+            if not args.session_id or not re.fullmatch(r'[a-f0-9]{32}', args.session_id):
+                raise ValueError('Invalid session id')
+            (worker if args.action == 'worker' else settings_worker)(args.session_id)
+            return
+        if args.action == 'toggle':
+            (stop if status()['state'] in ('recording', 'starting') else start)()
+        elif args.action in ('start', 'stop', 'cancel'):
+            globals()[args.action]()
+        elif args.action in ('copy', 'copy-raw', 'retry', 'clear'):
+            recover(args.action)
+        elif args.action == 'settings':
+            settings(json.loads(args.glossary), json.loads(args.rules))
+        print(json.dumps({'ok': True, **status()}, ensure_ascii=False))
+    except Exception as exc:
+        # Commands and transcripts are never included in subprocess errors.
+        error = message('busy') if isinstance(exc, BlockingIOError) else str(exc) if isinstance(exc, (RuntimeError, ValueError)) else f'{type(exc).__name__}: operación fallida'
+        print(json.dumps({'ok': False, 'error': error}, ensure_ascii=False))
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
